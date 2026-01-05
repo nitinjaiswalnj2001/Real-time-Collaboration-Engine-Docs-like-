@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Collab Engine Demo</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 18px; color: #111; }
+      .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+      input, button { padding: 8px 10px; font-size: 14px; }
+      button { cursor: pointer; }
+      .status { padding: 6px 10px; border-radius: 999px; font-size: 13px; background: #f2f2f2; }
+      .wrap { margin-top: 14px; display: grid; grid-template-columns: 1fr 280px; gap: 14px; }
+      .card { border: 1px solid #e6e6e6; border-radius: 12px; padding: 12px; }
+      .editorWrap { position: relative; }
+      textarea.editor {
+        width: 100%;
+        height: 360px;
+        box-sizing: border-box;
+        padding: 12px;
+        border-radius: 12px;
+        border: 1px solid #ddd;
+        font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        white-space: pre-wrap;
+        overflow-wrap: break-word;
+        resize: vertical;
+      }
+      .overlay {
+        position: absolute;
+        left: 1px; top: 1px;
+        right: 1px; bottom: 1px;
+        padding: 12px;
+        pointer-events: none;
+        overflow: hidden;
+      }
+      .cursor {
+        position: absolute;
+        width: 0;
+        border-left: 2px solid #000;
+        height: 1.4em;
+      }
+      .cursor .label {
+        position: absolute;
+        left: 4px;
+        top: -1.1em;
+        padding: 2px 6px;
+        font-size: 11px;
+        border-radius: 999px;
+        background: #111;
+        color: #fff;
+        white-space: nowrap;
+      }
+      /* hidden mirror for caret coordinate calc */
+      .mirror {
+        position: absolute;
+        left: -99999px;
+        top: -99999px;
+        visibility: hidden;
+        white-space: pre-wrap;
+        overflow-wrap: break-word;
+      }
+      .muted { color: #666; font-size: 13px; }
+      ul { margin: 8px 0 0; padding-left: 18px; }
+      code { background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }
+    </style>
+    <script src="/socket.io/socket.io.js"></script>
+  </head>
+  <body>
+    <h2 style="margin:0 0 10px;">Real-time Collaboration Engine (Demo)</h2>
+
+    <div class="row">
+      <label>Doc ID <input id="docId" size="14" /></label>
+      <label class="muted">Token (optional) <input id="token" size="14" placeholder="JOIN_TOKEN" /></label>
+      <button id="joinBtn">Join</button>
+      <span id="status" class="status">disconnected</span>
+      <span class="muted">Open in two tabs with same Doc ID to test.</span>
+    </div>
+
+    <div class="wrap">
+      <div class="card">
+        <div class="muted" style="margin-bottom:8px;">
+          You are <b id="me"></b>. Remote cursors are shown as colored carets + name tags.
+        </div>
+
+        <div class="editorWrap">
+          <textarea id="editor" class="editor" placeholder="Type here..."></textarea>
+          <div id="overlay" class="overlay"></div>
+          <div id="mirror" class="editor mirror"></div>
+        </div>
+
+        <div class="muted" style="margin-top:10px;">
+          Tip: shareable URL: <code>?doc=demo</code>
+        </div>
+      </div>
+
+      <div class="card">
+        <div><b>Presence</b></div>
+        <div id="presence" class="muted" style="margin-top:6px;">(none yet)</div>
+        <hr style="border:none;border-top:1px solid #eee;margin:12px 0;" />
+        <div><b>Debug</b></div>
+        <div class="muted" id="debug" style="margin-top:6px;"></div>
+      </div>
+    </div>
+
+    <script type="module">
+      import * as Y from "https://esm.sh/yjs@13.6.19";
+      import {
+        Awareness,
+        applyAwarenessUpdate,
+        encodeAwarenessUpdate
+      } from "https://esm.sh/y-protocols@1.0.6/awareness";
+
+      const $ = (id) => document.getElementById(id);
+
+      const docIdInput = $("docId");
+      const tokenInput = $("token");
+      const joinBtn = $("joinBtn");
+      const statusEl = $("status");
+      const meEl = $("me");
+      const editor = $("editor");
+      const overlay = $("overlay");
+      const presenceEl = $("presence");
+      const debugEl = $("debug");
+      const mirror = $("mirror");
+
+      const params = new URLSearchParams(location.search);
+      docIdInput.value = params.get("doc") || "demo";
+
+      const socket = window.io();
+
+      const rand = (n) => Math.floor(Math.random() * n);
+      const COLORS = ["#e11d48", "#f97316", "#eab308", "#22c55e", "#06b6d4", "#3b82f6", "#8b5cf6"];
+      const myUser = {
+        name: `user-${rand(9999)}`,
+        color: COLORS[rand(COLORS.length)]
+      };
+      meEl.textContent = `${myUser.name} (${myUser.color})`;
+
+      const ydoc = new Y.Doc();
+      const ytext = ydoc.getText("content");
+      const awareness = new Awareness(ydoc);
+      awareness.setLocalStateField("user", myUser);
+
+      let joinedDocId = null;
+      let lastText = "";
+
+      function setStatus(s) {
+        statusEl.textContent = s;
+      }
+
+      function setDebug(obj) {
+        debugEl.textContent = JSON.stringify(obj, null, 2);
+      }
+
+      function updateUrl(docId) {
+        const u = new URL(location.href);
+        u.searchParams.set("doc", docId);
+        history.replaceState(null, "", u.toString());
+      }
+
+      function applyTextDiff(oldStr, newStr) {
+        if (oldStr === newStr) return;
+
+        let start = 0;
+        const oldLen = oldStr.length;
+        const newLen = newStr.length;
+
+        while (start < oldLen && start < newLen && oldStr[start] === newStr[start]) start++;
+
+        let endOld = oldLen - 1;
+        let endNew = newLen - 1;
+        while (endOld >= start && endNew >= start && oldStr[endOld] === newStr[endNew]) {
+          endOld--;
+          endNew--;
+        }
+
+        const deleteCount = endOld - start + 1;
+        const insertText = newStr.slice(start, endNew + 1);
+
+        if (deleteCount > 0) ytext.delete(start, deleteCount);
+        if (insertText.length > 0) ytext.insert(start, insertText);
+      }
+
+      // Remote updates -> update textarea (best-effort keep selection)
+      ytext.observe((evt) => {
+        if (evt.transaction.origin === "editor") {
+          lastText = ytext.toString();
+          return;
+        }
+
+        const v = ytext.toString();
+        const s0 = editor.selectionStart ?? 0;
+        const s1 = editor.selectionEnd ?? 0;
+
+        editor.value = v;
+        lastText = v;
+
+        editor.selectionStart = Math.min(s0, v.length);
+        editor.selectionEnd = Math.min(s1, v.length);
+
+        renderPresence();
+        renderCursors();
+      });
+
+      // Local textarea edits -> Yjs
+      editor.addEventListener("input", () => {
+        const v = editor.value;
+        ydoc.transact(() => applyTextDiff(lastText, v), "editor");
+        lastText = ytext.toString();
+        updateCursor();
+      });
+
+      function updateCursor() {
+        if (!joinedDocId) return;
+        const anchor = editor.selectionStart ?? 0;
+        const head = editor.selectionEnd ?? 0;
+        awareness.setLocalStateField("cursor", { anchor, head });
+        renderCursors();
+      }
+
+      editor.addEventListener("keyup", updateCursor);
+      editor.addEventListener("click", updateCursor);
+      editor.addEventListener("select", updateCursor);
+      editor.addEventListener("scroll", () => renderCursors());
+
+      // Yjs updates -> server
+      ydoc.on("update", (u8, origin) => {
+        if (!joinedDocId) return;
+        if (origin === "remote") return;
+        socket.emit("yjs-update", { docId: joinedDocId, update: Array.from(u8) });
+      });
+
+      // Awareness updates -> server
+      awareness.on("update", ({ added, updated, removed }, origin) => {
+        if (!joinedDocId) return;
+        if (origin === "remote") return;
+        const changed = added.concat(updated).concat(removed);
+        if (changed.length === 0) return;
+        const u8 = encodeAwarenessUpdate(awareness, changed);
+        socket.emit("awareness", { docId: joinedDocId, update: Array.from(u8) });
+      });
+
+      // Server -> Yjs/Awareness
+      socket.on("connect", () => setStatus("connected"));
+      socket.on("disconnect", () => setStatus("disconnected"));
+
+      socket.on("join-error", (p) => {
+        setStatus("join-error");
+        alert(`Join failed for doc "${p?.docId}": ${p?.error || "unknown"}`);
+      });
+
+      socket.on("yjs-sync", ({ docId, update }) => {
+        if (!joinedDocId || docId !== joinedDocId) return;
+        Y.applyUpdate(ydoc, Uint8Array.from(update), "remote");
+        // seed textarea
+        const v = ytext.toString();
+        editor.value = v;
+        lastText = v;
+        updateCursor();
+        renderPresence();
+        renderCursors();
+      });
+
+      socket.on("yjs-update", ({ docId, update }) => {
+        if (!joinedDocId || docId !== joinedDocId) return;
+        Y.applyUpdate(ydoc, Uint8Array.from(update), "remote");
+      });
+
+      socket.on("awareness", ({ docId, update }) => {
+        if (!joinedDocId || docId !== joinedDocId) return;
+        applyAwarenessUpdate(awareness, Uint8Array.from(update), "remote");
+        renderPresence();
+        renderCursors();
+      });
+
+      function join() {
+        const docId = docIdInput.value.trim();
+        if (!docId) return;
+
+        joinedDocId = docId;
+        updateUrl(docId);
+
+        socket.emit("join", { docId, token: tokenInput.value.trim() || undefined });
+        setStatus("joining...");
+        setDebug({ docId, myClientId: ydoc.clientID, user: myUser });
+
+        // push cursor state immediately after join
+        setTimeout(() => updateCursor(), 50);
+      }
+
+      joinBtn.addEventListener("click", join);
+
+      // ---------- Cursor rendering ----------
+      function getCaretCoords(pos) {
+        // mirror mimics textarea layout, so span offset == caret coords
+        mirror.style.width = editor.clientWidth + "px";
+        mirror.style.height = editor.clientHeight + "px";
+        mirror.scrollTop = editor.scrollTop;
+        mirror.scrollLeft = editor.scrollLeft;
+
+        const text = editor.value;
+        const before = text.slice(0, pos);
+        const after = text.slice(pos) || " ";
+
+        mirror.textContent = before;
+
+        const span = document.createElement("span");
+        span.textContent = after[0];
+        mirror.appendChild(span);
+
+        return {
+          left: span.offsetLeft - editor.scrollLeft,
+          top: span.offsetTop - editor.scrollTop
+        };
+      }
+
+      function renderCursors() {
+        overlay.innerHTML = "";
+        const states = awareness.getStates();
+
+        for (const [clientId, st] of states.entries()) {
+          if (clientId === ydoc.clientID) continue;
+
+          const user = st?.user;
+          const cur = st?.cursor;
+          if (!user || !cur) continue;
+
+          const pos = typeof cur.head === "number" ? cur.head : 0;
+          const coords = getCaretCoords(Math.max(0, Math.min(pos, editor.value.length)));
+
+          const el = document.createElement("div");
+          el.className = "cursor";
+          el.style.left = coords.left + "px";
+          el.style.top = coords.top + "px";
+          el.style.borderLeftColor = user.color;
+
+          const label = document.createElement("div");
+          label.className = "label";
+          label.textContent = user.name;
+          label.style.background = user.color;
+
+          el.appendChild(label);
+          overlay.appendChild(el);
+        }
+      }
+
+      function renderPresence() {
+        const states = Array.from(awareness.getStates().values())
+          .map((s) => s?.user)
+          .filter(Boolean);
+
+        if (states.length === 0) {
+          presenceEl.textContent = "(none yet)";
+          return;
+        }
+
+        const uniq = new Map();
+        for (const u of states) uniq.set(u.name, u);
+
+        const items = Array.from(uniq.values())
+          .map((u) => `• ${u.name} (${u.color})`)
+          .join("\n");
+
+        presenceEl.textContent = items;
+      }
+
+      // auto-join on load (so two tabs “just work”)
+      join();
+    </script>
+  </body>
+</html>
